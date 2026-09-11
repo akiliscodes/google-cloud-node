@@ -54,6 +54,7 @@ export class MetricsTracerFactory {
   private _projectId: string;
   private _currentOperationTracers = new Map();
   private _currentOperationLastUpdatedMs = new Map();
+  private _operationLookupByPrefix = new Map<string, string>();
   private _intervalTracerCleanup: NodeJS.Timeout;
   public static enabled = true;
 
@@ -158,6 +159,7 @@ export class MetricsTracerFactory {
     this._meterProvider = null;
     this._currentOperationTracers = new Map();
     this._currentOperationLastUpdatedMs = new Map();
+    this._operationLookupByPrefix = new Map();
   }
 
   /**
@@ -256,6 +258,10 @@ export class MetricsTracerFactory {
     );
     this._currentOperationTracers.set(operationRequest, tracer);
     this._currentOperationLastUpdatedMs.set(operationRequest, Date.now());
+    const prefixKey = this._extractPrefixLookupKey(requestId);
+    if (prefixKey) {
+      this._operationLookupByPrefix.set(prefixKey, operationRequest);
+    }
     return tracer;
   }
 
@@ -292,13 +298,22 @@ export class MetricsTracerFactory {
    */
   public getCurrentTracer(requestId: string): MetricsTracer | null {
     const operationRequest: string = this._extractOperationRequest(requestId);
-    if (!this._currentOperationTracers.has(operationRequest)) {
-      // Attempting to retrieve tracer that doesn't exist.
-      return null;
+    if (this._currentOperationTracers.has(operationRequest)) {
+      this._currentOperationLastUpdatedMs.set(operationRequest, Date.now());
+      return this._currentOperationTracers.get(operationRequest) ?? null;
     }
-    this._currentOperationLastUpdatedMs.set(operationRequest, Date.now());
 
-    return this._currentOperationTracers.get(operationRequest) ?? null;
+    // O(1) fallback: match by (version, processId, clientId, nthRequest)
+    const prefixKey = this._extractPrefixLookupKey(requestId);
+    if (prefixKey) {
+      const mappedKey = this._operationLookupByPrefix.get(prefixKey);
+      if (mappedKey && this._currentOperationTracers.has(mappedKey)) {
+        this._currentOperationLastUpdatedMs.set(mappedKey, Date.now());
+        return this._currentOperationTracers.get(mappedKey) ?? null;
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -308,11 +323,36 @@ export class MetricsTracerFactory {
   public clearCurrentTracer(requestId: string) {
     const operationRequest =
       this._extractOperationRequest(requestId) || requestId;
-    if (!this._currentOperationTracers.has(operationRequest)) {
+    const prefixKey = this._extractPrefixLookupKey(requestId);
+
+    if (this._currentOperationTracers.has(operationRequest)) {
+      this._currentOperationTracers.delete(operationRequest);
+      this._currentOperationLastUpdatedMs.delete(operationRequest);
+      if (prefixKey) {
+        this._operationLookupByPrefix.delete(prefixKey);
+      }
       return;
     }
-    this._currentOperationTracers.delete(operationRequest);
-    this._currentOperationLastUpdatedMs.delete(operationRequest);
+
+    if (prefixKey) {
+      const mappedKey = this._operationLookupByPrefix.get(prefixKey);
+      if (mappedKey) {
+        this._currentOperationTracers.delete(mappedKey);
+        this._currentOperationLastUpdatedMs.delete(mappedKey);
+        this._operationLookupByPrefix.delete(prefixKey);
+      }
+    }
+  }
+
+  private _extractPrefixLookupKey(requestId: string): string | null {
+    if (!requestId) {
+      return null;
+    }
+    const parts = requestId.split('.');
+    if (parts.length >= 5) {
+      return `${parts[0]}.${parts[1]}.${parts[2]}.${parts[4]}`;
+    }
+    return null;
   }
 
   private _extractOperationRequest(requestId: string): string {
@@ -488,6 +528,10 @@ export class MetricsTracerFactory {
       if (Date.now() - lastUpdated >= Constants.TRACER_CLEANUP_THRESHOLD_MS) {
         this._currentOperationTracers.delete(operationTracer);
         this._currentOperationLastUpdatedMs.delete(operationTracer);
+        const prefixKey = this._extractPrefixLookupKey(operationTracer);
+        if (prefixKey) {
+          this._operationLookupByPrefix.delete(prefixKey);
+        }
       }
     }
   }

@@ -48,10 +48,11 @@ import IsolationLevel = google.spanner.v1.TransactionOptions.IsolationLevel;
 import IAny = google.protobuf.IAny;
 import IQueryOptions = google.spanner.v1.ExecuteSqlRequest.IQueryOptions;
 import IRequestOptions = google.spanner.v1.IRequestOptions;
-import {Database, Spanner} from '.';
+import type {Database, Spanner} from '.';
 import ReadLockMode = google.spanner.v1.TransactionOptions.ReadWrite.ReadLockMode;
 import {RunTransactionOptions} from './transaction-runner';
 import {injectRequestIDIntoHeaders, nextNthRequest} from './request_id_header';
+import {TransactionAffinity} from './channel-pool';
 
 export type Rows = Array<Row | Json>;
 const RETRY_INFO_TYPE = 'type.googleapis.com/google.rpc.retryinfo';
@@ -224,10 +225,6 @@ export interface BatchUpdateCallback {
     response?: spannerClient.spanner.v1.ExecuteBatchDmlResponse,
   ): void;
 }
-export interface BatchUpdateOptions {
-  requestOptions?: Omit<IRequestOptions, 'transactionTag'>;
-  gaxOptions?: CallOptions;
-}
 
 export type ReadCallback = NormalCallback<Rows>;
 
@@ -319,6 +316,7 @@ export class Snapshot extends EventEmitter {
     | null;
   id?: Uint8Array | string;
   protected _affinityKey?: string;
+  protected _affinity?: TransactionAffinity;
   protected _bindGaxOpts?: CallOptions;
   protected _unbindGaxOpts?: CallOptions;
   multiplexedSessionPreviousTransactionId?: Uint8Array | string;
@@ -336,6 +334,10 @@ export class Snapshot extends EventEmitter {
   _traceConfig: traceConfig;
   protected _dbName?: string;
   protected _mutationKey: spannerClient.spanner.v1.Mutation | null;
+
+  get affinity(): TransactionAffinity | undefined {
+    return this._affinity;
+  }
 
   /**
    * The transaction ID.
@@ -384,69 +386,48 @@ export class Snapshot extends EventEmitter {
     session: Session,
     options?: TimestampBounds,
     queryOptions?: IQueryOptions,
+    affinity?: TransactionAffinity,
   ) {
     super();
 
     this.ended = false;
     this.session = session;
     this.queryOptions = Object.assign({}, queryOptions);
-    // If the session is multiplexed, generate a unique affinity key for this
-    // specific transaction/snapshot. This allows requests using the same shared
-    // multiplexed session to be distributed across different gRPC channels.
-    if (session.metadata && session.metadata.multiplexed) {
-      this._affinityKey = `mux-affinity-${process.pid}-${nextAffinityId++}`;
+    // Create transaction affinity handle and generate a unique affinity key for this specific transaction/snapshot.
+    this._affinity = affinity;
+    if (this._affinity) {
+      this._affinityKey =
+        session.metadata && session.metadata.multiplexed
+          ? `mux-affinity-${process.pid}-${nextAffinityId++}`
+          : `affinity-${process.pid}-${nextAffinityId++}`;
       // Pre-construct and cache the bind gax options to avoid creating
       // a new object on every request, which improves performance.
       this._bindGaxOpts = {
         otherArgs: {
           options: {
+            affinity: this._affinity,
             affinityKey: this._affinityKey,
           },
         },
       };
-      // Pre-construct and cache the unbind gax options. This explicitly signals
-      // the channel factory to release the affinity mapping when the transaction ends.
+      // Pre-construct and cache the unbind gax options.
       this._unbindGaxOpts = {
         otherArgs: {
           options: {
+            affinity: this._affinity,
             affinityKey: this._affinityKey,
             unbind: true,
           },
         },
       };
-      this.request = (config: any, callback?: Function) => {
-        let gaxOpts;
-        if (!config.gaxOpts || Object.keys(config.gaxOpts).length === 0) {
-          gaxOpts = this._bindGaxOpts as any;
-        } else {
-          gaxOpts = injectGaxOpt(
-            config.gaxOpts,
-            'affinityKey',
-            this._affinityKey,
-          );
-        }
-        config = Object.assign({}, config, {gaxOpts});
-        return session.request(config, callback);
-      };
-
-      this.requestStream = (config: any) => {
-        let gaxOpts;
-        if (!config.gaxOpts || Object.keys(config.gaxOpts).length === 0) {
-          gaxOpts = this._bindGaxOpts as any;
-        } else {
-          gaxOpts = injectGaxOpt(
-            config.gaxOpts,
-            'affinityKey',
-            this._affinityKey,
-          );
-        }
-        config = Object.assign({}, config, {gaxOpts});
-        return session.requestStream(config);
-      };
-    } else {
-      this.request = session.request.bind(session);
-      this.requestStream = session.requestStream.bind(session);
     }
+    this.request = (config: any, callback?: Function) => {
+      return session.request(this._injectAffinity(config), callback);
+    };
+
+    this.requestStream = (config: any) => {
+      return session.requestStream(this._injectAffinity(config));
+    };
 
     const readOnly = Snapshot.encodeTimestampBounds(options || {});
     this._options = {readOnly};
@@ -461,6 +442,20 @@ export class Snapshot extends EventEmitter {
     };
     this._latestPreCommitToken = null;
     this._mutationKey = null;
+  }
+
+  protected _injectAffinity(config: any): any {
+    if (!this._affinity) {
+      return config;
+    }
+    config = config || {};
+    let gaxOpts;
+    if (!config.gaxOpts || Object.keys(config.gaxOpts).length === 0) {
+      gaxOpts = this._bindGaxOpts;
+    } else {
+      gaxOpts = injectGaxOpt(config.gaxOpts, 'affinity', this._affinity);
+    }
+    return Object.assign({}, config, {gaxOpts});
   }
 
   protected _updatePrecommitToken(resp: PrecommitTokenProvider): void {
@@ -697,7 +692,13 @@ export class Snapshot extends EventEmitter {
             method: 'beginTransaction',
             reqOpts,
             gaxOpts,
-            headers: injectRequestIDIntoHeaders(headers, this.session),
+            headers: injectRequestIDIntoHeaders(
+              headers,
+              this.session,
+              undefined,
+              undefined,
+              this._affinity?.pinnedEntryId() ?? undefined,
+            ),
           },
           (
             err: null | grpc.ServiceError,
@@ -1001,6 +1002,7 @@ export class Snapshot extends EventEmitter {
             this.session,
             nthRequest,
             attempt,
+            this._affinity?.pinnedEntryId() ?? undefined,
           ),
         });
       };
@@ -1109,18 +1111,8 @@ export class Snapshot extends EventEmitter {
     this.ended = true;
     process.nextTick(() => this.emit('end'));
 
-    if (this._affinityKey) {
-      const database = this.session?.parent as Database;
-      const spanner = database?.parent?.parent as Spanner;
-      const client = spanner?.clients_?.get('SpannerClient') as any;
-
-      if (client?.spannerStub) {
-        Promise.resolve(client.spannerStub)
-          .then((stub: any) => {
-            stub?.getChannel?.()?.unbind?.(this._affinityKey);
-          })
-          .catch(() => {});
-      }
+    if (this._affinity) {
+      this._affinity.release();
     }
   }
 
@@ -1634,6 +1626,7 @@ export class Snapshot extends EventEmitter {
             this.session,
             nthRequest,
             attempt,
+            this._affinity?.pinnedEntryId() ?? undefined,
           ),
         });
       };
@@ -1852,7 +1845,9 @@ export class Snapshot extends EventEmitter {
    */
   protected _getDirectedReadOptions(
     directedReadOptions:
-      google.spanner.v1.IDirectedReadOptions | null | undefined,
+      | google.spanner.v1.IDirectedReadOptions
+      | null
+      | undefined,
   ) {
     if (
       !directedReadOptions &&
@@ -2137,7 +2132,7 @@ export class Transaction extends Dml {
     queryOptions?: IQueryOptions,
     requestOptions?: Pick<IRequestOptions, 'transactionTag'>,
   ) {
-    super(session, undefined, queryOptions);
+    super(session, undefined, queryOptions, TransactionAffinity.newReadWrite());
 
     this._queuedMutations = [];
     this._options = {readWrite: options};
@@ -2297,6 +2292,7 @@ export class Transaction extends Dml {
       this.session,
       nextNthRequest(database),
       1,
+      this._affinity?.pinnedEntryId() ?? undefined,
     );
     if (this._getSpanner().routeToLeaderEnabled) {
       addLeaderAwareRoutingHeader(headers);
@@ -2470,7 +2466,7 @@ export class Transaction extends Dml {
       typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
     const callback =
       typeof optionsOrCallback === 'function' ? optionsOrCallback : cb!;
-    let gaxOpts =
+    const gaxOpts =
       'gaxOptions' in options ? (options as CommitOptions).gaxOptions : options;
 
     const mutations = this._queuedMutations;
@@ -2545,13 +2541,6 @@ export class Transaction extends Dml {
         span.addEvent('Starting Commit');
 
         const database = this.session.parent as Database;
-        if (this._affinityKey) {
-          if (!gaxOpts || Object.keys(gaxOpts).length === 0) {
-            gaxOpts = this._unbindGaxOpts as any;
-          } else {
-            gaxOpts = injectGaxOpt(gaxOpts, 'unbind', true);
-          }
-        }
 
         this.request(
           {
@@ -2564,6 +2553,7 @@ export class Transaction extends Dml {
               this.session,
               nextNthRequest(database),
               1,
+              this._affinity?.pinnedEntryId() ?? undefined,
             ),
           },
           (
@@ -2909,10 +2899,11 @@ export class Transaction extends Dml {
   ): void;
   rollback(
     gaxOptionsOrCallback?:
-      CallOptions | spannerClient.spanner.v1.Spanner.RollbackCallback,
+      | CallOptions
+      | spannerClient.spanner.v1.Spanner.RollbackCallback,
     cb?: spannerClient.spanner.v1.Spanner.RollbackCallback,
   ): void | Promise<void> {
-    let gaxOpts =
+    const gaxOpts =
       typeof gaxOptionsOrCallback === 'object' ? gaxOptionsOrCallback : {};
     const callback =
       typeof gaxOptionsOrCallback === 'function' ? gaxOptionsOrCallback : cb!;
@@ -2935,14 +2926,6 @@ export class Transaction extends Dml {
       const headers = this.commonHeaders_;
       if (this._getSpanner().routeToLeaderEnabled) {
         addLeaderAwareRoutingHeader(headers);
-      }
-
-      if (this._affinityKey) {
-        if (!gaxOpts || Object.keys(gaxOpts).length === 0) {
-          gaxOpts = this._unbindGaxOpts as any;
-        } else {
-          gaxOpts = injectGaxOpt(gaxOpts, 'unbind', true);
-        }
       }
 
       this.request(

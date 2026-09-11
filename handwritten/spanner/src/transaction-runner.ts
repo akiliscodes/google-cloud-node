@@ -247,6 +247,12 @@ export abstract class Runner<T> {
         this.session.lastError = e as grpc.ServiceError;
         lastError = e as grpc.ServiceError;
       } finally {
+        if (
+          typeof (transaction as any).end === 'function' &&
+          !transaction.ended
+        ) {
+          transaction.end();
+        }
         this.multiplexedSessionPreviousTransactionId = transaction.id;
       }
 

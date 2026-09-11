@@ -74,6 +74,9 @@ import {
   CLOUD_RESOURCE_HEADER,
   NormalCallback,
   getCommonHeaders,
+  isAFEServerTimingEnabled,
+  isDynamicChannelPoolEnabled,
+  resetAFEServerTimingForTest,
 } from './common';
 import {Session} from './session';
 import {SessionPool} from './session-pool';
@@ -85,8 +88,15 @@ import {
   Snapshot,
   Transaction,
 } from './transaction';
-import grpcGcpModule = require('grpc-gcp');
-const grpcGcp = grpcGcpModule(grpc);
+import {
+  AffinityKind,
+  ChannelPool,
+  ChannelPoolHolder,
+  ChannelPoolOptions,
+  TransactionAffinity,
+  callInvocationTransformer,
+  channelFactoryOverride,
+} from './channel-pool';
 import * as v1 from './v1';
 import {
   ObservabilityOptions,
@@ -103,9 +113,6 @@ import {MetricInterceptor} from './metrics/interceptor';
 import {CloudMonitoringMetricsExporter} from './metrics/spanner-metrics-exporter';
 import {MetricsTracerFactory} from './metrics/metrics-tracer-factory';
 import {MetricsTracer} from './metrics/metrics-tracer';
-
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const gcpApiConfig = require('./spanner_grpc_config.json');
 
 export type IOperation = instanceAdmin.longrunning.IOperation;
 
@@ -171,6 +178,14 @@ export interface SpannerOptions extends GrpcClientOptions {
   disableBuiltInMetrics?: boolean;
   interceptors?: any[];
   sessionLabels?: {[key: string]: string};
+  /**
+   * Whether to enable dynamic channel pooling. Defaults to `true`.
+   * Can also be controlled via `SPANNER_ENABLE_DYNAMIC_CHANNEL_POOL` environment variable.
+   * When disabled, the channel pool operates in static mode with fixed channel count.
+   */
+  enableDynamicChannelPool?: boolean;
+  channelPool?: boolean | number | ChannelPoolOptions;
+  channelPoolOptions?: ChannelPoolOptions;
   /**
    * The Trusted Cloud Domain (TPC) DNS of the service used to make requests.
    * Defaults to `googleapis.com`.
@@ -329,7 +344,6 @@ class Spanner extends GrpcService {
   private _universeDomain: string;
   private _isInSecureCredentials: boolean;
   private _metricsEnabled = false;
-  private static _isAFEServerTimingEnabled: boolean | undefined;
   readonly _nthClientId: number;
 
   /**
@@ -356,24 +370,26 @@ class Spanner extends GrpcService {
    *
    * @returns {boolean} `true` if AFE server timing is enabled; otherwise, `false`.
    */
-  public static isAFEServerTimingEnabled = (): boolean => {
-    if (this._isAFEServerTimingEnabled === undefined) {
-      this._isAFEServerTimingEnabled =
-        process.env['SPANNER_DISABLE_AFE_SERVER_TIMING'] !== 'true';
-    }
-    return this._isAFEServerTimingEnabled;
-  };
+  public static isAFEServerTimingEnabled = isAFEServerTimingEnabled;
 
   /** Resets the cached value (use in tests if env changes). */
   public static _resetAFEServerTimingForTest(): void {
-    this._isAFEServerTimingEnabled = undefined;
+    resetAFEServerTimingForTest();
   }
+
+  /**
+   * Checks whether dynamic channel pooling is enabled.
+   * Defaults to true. Can be disabled via environment variable
+   * SPANNER_ENABLE_DYNAMIC_CHANNEL_POOL=false.
+   */
+  public static isDynamicChannelPoolEnabled = isDynamicChannelPoolEnabled;
 
   /**
    * Gets the configured Spanner emulator host from an environment variable.
    */
   static getSpannerEmulatorHost():
-    {endpoint: string; port?: number} | undefined {
+    | {endpoint: string; port?: number}
+    | undefined {
     const endpointWithPort = process.env.SPANNER_EMULATOR_HOST;
     if (endpointWithPort) {
       if (
@@ -416,6 +432,8 @@ class Spanner extends GrpcService {
       }
     }
 
+    const channelPoolHolder: ChannelPoolHolder = {};
+
     options = Object.assign(
       {
         libName: 'gccl',
@@ -423,14 +441,50 @@ class Spanner extends GrpcService {
         scopes,
         // Add grpc keep alive setting
         'grpc.keepalive_time_ms': 120000,
-        // Enable grpc-gcp support
-        'grpc.callInvocationTransformer': grpcGcp.gcpCallInvocationTransformer,
-        'grpc.channelFactoryOverride': grpcGcp.gcpChannelFactoryOverride,
-        'grpc.gcpApiConfig': grpcGcp.createGcpApiConfig(gcpApiConfig),
+        // Native Spanner channel pool support
+        'grpc.callInvocationTransformer': callInvocationTransformer,
+        'grpc.channelFactoryOverride': channelFactoryOverride,
+        'grpc.spanner_channel_pool_holder': channelPoolHolder,
         grpc,
       },
       options || {},
     ) as {} as SpannerOptions;
+
+    const enableDynamicChannelPool =
+      options.enableDynamicChannelPool !== undefined
+        ? options.enableDynamicChannelPool
+        : options.channelPool === false
+          ? false
+          : isDynamicChannelPoolEnabled();
+
+    let channelPoolOptions: ChannelPoolOptions | undefined =
+      typeof options.channelPool === 'object'
+        ? options.channelPool
+        : typeof options.channelPool === 'number'
+          ? {
+              initialChannels: options.channelPool,
+              minChannels: options.channelPool,
+              maxChannels: options.channelPool,
+            }
+          : options.channelPoolOptions;
+
+    if (!enableDynamicChannelPool) {
+      const fixedChannels =
+        channelPoolOptions?.minChannels ??
+        channelPoolOptions?.initialChannels ??
+        4;
+      channelPoolOptions = {
+        ...(channelPoolOptions || {}),
+        initialChannels: fixedChannels,
+        minChannels: fixedChannels,
+        maxChannels: fixedChannels,
+      };
+    }
+
+    if (channelPoolOptions) {
+      (options as any)['grpc.spanner_channel_pool_options'] =
+        channelPoolOptions;
+    }
 
     const directedReadOptions = options.directedReadOptions
       ? options.directedReadOptions
@@ -510,6 +564,13 @@ class Spanner extends GrpcService {
     this._universeDomain = universeEndpoint;
     this.projectId_ = options.projectId;
     this.configureMetrics_(options.disableBuiltInMetrics);
+    this._channelPoolHolder = channelPoolHolder;
+  }
+
+  _channelPoolHolder?: ChannelPoolHolder;
+
+  get channelPool_(): ChannelPool | undefined {
+    return this._channelPoolHolder?.pool;
   }
 
   get universeDomain() {
@@ -596,6 +657,14 @@ class Spanner extends GrpcService {
           ),
         ),
       );
+
+      if (this._channelPoolHolder?.pools) {
+        for (const pool of this._channelPoolHolder.pools.values()) {
+          pool.close();
+        }
+      } else if (this.channelPool_) {
+        this.channelPool_.close();
+      }
 
       // Always execute cleanup
       try {
@@ -1562,7 +1631,8 @@ class Spanner extends GrpcService {
   ): void;
   getInstanceConfigOperations(
     optionsOrCallback?:
-      GetInstanceConfigOperationsOptions | GetInstanceConfigOperationsCallback,
+      | GetInstanceConfigOperationsOptions
+      | GetInstanceConfigOperationsCallback,
     cb?: GetInstanceConfigOperationsCallback,
   ): void | Promise<GetInstanceConfigOperationsResponse> {
     const callback =
@@ -2459,3 +2529,12 @@ export {v1, protos};
 export default {Spanner};
 export {Float32, Float, Int, Struct, Numeric, PGNumeric, SpannerDate, Interval};
 export {ObservabilityOptions};
+export {
+  AffinityKind,
+  ChannelPool,
+  ChannelPoolHolder,
+  ChannelPoolOptions,
+  TransactionAffinity,
+  callInvocationTransformer,
+  channelFactoryOverride,
+};

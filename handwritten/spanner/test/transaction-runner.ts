@@ -33,6 +33,10 @@ const concat = require('concat-stream');
 
 class FakeTransaction extends EventEmitter {
   multiplexedSessionPreviousTransactionId;
+  ended = false;
+  end(): void {
+    this.ended = true;
+  }
   async begin(): Promise<void> {}
   request() {}
   requestStream() {}
@@ -317,6 +321,51 @@ describe('TransactionRunner', () => {
         assert.strictEqual(returnValue, fakeReturnValue);
         assert.strictEqual(runner.attempts, 1);
         assert.strictEqual(delayStub.callCount, 1);
+      });
+
+      it('should end transaction on failure or abort to clean up resources', async () => {
+        const fakeError = new Error('aborted') as grpc.ServiceError;
+        fakeError.code = grpc.status.ABORTED;
+        const fakeReturnValue = 42;
+
+        const firstTransaction = new FakeTransaction();
+        const endSpy1 = sandbox.spy(firstTransaction, 'end');
+        const secondTransaction = new FakeTransaction();
+        const endSpy2 = sandbox.spy(secondTransaction, 'end');
+
+        getTransactionStub.onCall(0).resolves(firstTransaction);
+        getTransactionStub.onCall(1).resolves(secondTransaction);
+
+        runFn.onCall(0).rejects(fakeError);
+        runFn.onCall(1).callsFake(async (txn: any) => {
+          txn.ended = true;
+          return fakeReturnValue;
+        });
+
+        sandbox.stub(runner, 'getNextDelay').returns(0);
+
+        const result = await runner.run();
+        assert.strictEqual(result, fakeReturnValue);
+        assert.strictEqual(endSpy1.callCount, 1);
+        assert.strictEqual(firstTransaction.ended, true);
+        assert.strictEqual(endSpy2.callCount, 0); // Already ended by commit
+      });
+
+      it('should end transaction when non-retryable error throws', async () => {
+        const fakeError = new Error('fatal') as grpc.ServiceError;
+        fakeError.code = grpc.status.INVALID_ARGUMENT;
+
+        const txn = new FakeTransaction();
+        const endSpy = sandbox.spy(txn, 'end');
+        getTransactionStub.resolves(txn);
+        runFn.rejects(fakeError);
+
+        await assert.rejects(async () => {
+          await runner.run();
+        }, fakeError);
+
+        assert.strictEqual(endSpy.callCount, 1);
+        assert.strictEqual(txn.ended, true);
       });
 
       it('should throw a DeadlineError if the timeout is exceeded', done => {

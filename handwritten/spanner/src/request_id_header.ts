@@ -123,6 +123,7 @@ function injectRequestIDIntoHeaders(
   session: any,
   nthRequest?: number,
   attempt?: number,
+  channelId?: number,
 ) {
   if (!session) {
     return headers;
@@ -135,12 +136,17 @@ function injectRequestIDIntoHeaders(
     nthRequest = database._nextNthRequest();
   }
   const clientId = database ? database._nthClientId || 1 : 1;
-  const channelId = database ? database._channelId || 1 : 1;
+  const chanId =
+    channelId !== undefined
+      ? channelId
+      : database
+        ? database._channelId || 1
+        : 1;
 
   const withReqId = {...headers};
   withReqId[X_GOOG_SPANNER_REQUEST_ID_HEADER] = craftRequestId(
     clientId,
-    channelId,
+    chanId,
     nthRequest || 1,
     attempt || 1,
   );
